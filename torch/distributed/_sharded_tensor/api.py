@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Dict,
-    List
+    List,
+    Optional,
 )
 
 import threading
@@ -176,6 +177,31 @@ class TensorInitParams(object):
                                  memory_format=torch.contiguous_format,
                                  pin_memory=False))
 
+def _validate_output_tensor_for_gather(
+    my_rank: int,
+    dst_rank: int,
+    size: torch.Size,
+    dst_tensor: Optional[torch.Tensor],
+):
+    if dst_rank == my_rank:
+        if not dst_tensor:
+            raise ValueError(
+                f"Argument ``dst_tensor`` must be specified on destination rank {dst_rank}"
+            )
+        if torch.count_nonzero(dst_tensor):
+            raise ValueError(
+                "Argument ``dst_tensor`` should be a zero tensor."
+            )
+        if size != dst_tensor.size():
+            raise ValueError(
+                f"Argument ``dst_tensor`` have size {size}"
+            )
+
+    elif dst_tensor:
+        raise ValueError(
+            "Argument ``dst_tensor`` must NOT be specified "
+            "on non-destination ranks."
+        )
 
 class ShardedTensor(object):
     """
@@ -194,7 +220,7 @@ class ShardedTensor(object):
     create_op specified by tensor_init_params.create_op, e.g., torch.ones, or
     torch.empty
 
-    Args:
+    Arg:
         sharding_spec (:class:`torch.distributed._sharding_spec.ShardingSpec`): The specification
             describing how to shard the Tensor.
         size (int...): a sequence of integers defining the shape of the output
@@ -334,6 +360,82 @@ class ShardedTensor(object):
 
         # Barrier for all RPCs to finish on all ranks.
         rpc.api._all_gather(None)
+
+    def gather(
+        self,
+        dst: int = 0,
+        out: Optional[torch.Tensor] = None,
+    ):
+        """
+        Creates a full :class:`Tensor` on rank `dst` by gathering all sharded tensors.
+
+        The API needs to be called on all ranks in SPMD fashion. All ranks should have
+        the same `dst`. `out` should be a full size zero tensor on `dst` and
+        None on all other ranks.
+
+        Args:
+            dst(int): The rank where full tensor is constructed
+            out (:class `torch.Tensor` optional): The output full tensor. Needs to be provided
+            ONLY on `dst`
+        """
+        my_rank = dist.get_rank(self._process_group)
+        full_size = self.metadata().size
+        _validate_output_tensor_for_gather(my_rank, dst, full_size, out)
+
+        shard_tensors = self.local_shards()
+        flattened_shard_tensors = torch.stack(
+            [local_shard.tensor for local_shard in shard_tensors],
+        )
+        flattened_local_metadata = torch.stack(
+            [
+                torch.tensor(
+                    [
+                        local_shard.metadata.shard_offsets,
+                        local_shard.metadata.shard_lengths,
+                    ],
+                    dtype=torch.int,
+                ) for local_shard in shard_tensors
+            ],
+        )
+
+        gathered_shard_tensors = [None for _ in self._process_group.world_size]
+        gathered_local_metadata = [None for _ in self._process_group.world_size]
+
+        gather_tensor = dist.gather(
+            tensor=flattened_shard_tensors,
+            gather_list=gathered_shard_tensors,
+            dst=dst,
+            group=self._process_group,
+            async_op=True,
+        )
+
+        gather_metadata = dist.gather(
+            tensor=flattened_local_metadata,
+            gather_list=gathered_local_metadata,
+            dst=dst,
+            group=self._process_group,
+            async_op=True,
+        )
+
+        gather_tensor.wait()
+        gather_metadata.wait()
+
+        if my_rank == dst:
+            dims = len(full_size)
+            for sharded_tensor, sharded_metadata in zip(
+                gathered_shard_tensors,
+                gathered_local_metadata,
+            ):
+                # the idx-th shard from a rank
+                for idx in range(sharded_metadata.size()[0]):
+                    out_narrow_view = out
+                    for dim in range(dims):
+                        out_narrow_view = out_narrow_view.narrow(
+                            dim,
+                            gathered_local_metadata[idx][0][dim],
+                            gathered_local_metadata[idx][1][dim],
+                        )
+                    out_narrow_view.add_(sharded_tensor[idx])
 
     @classmethod
     def _init_from_local_shards(
